@@ -44,6 +44,28 @@ logging.basicConfig(
 )
 logger = logging.getLogger("mfp_mcp")
 
+
+def _patch_myfitnesspal_fooditem_missing_nutrients():
+    """myfitnesspal.FoodItem's nutrient properties index self.details[key]
+    directly, so any food missing a single nutrient field (common for
+    incomplete/user-submitted MFP entries -- e.g. many rice/grain items lack
+    trans_fat or protein) raises KeyError instead of returning None. Patch
+    to .get(key) so mfp_get_food_details degrades gracefully instead of
+    erroring on ordinary, common foods.
+    """
+    from myfitnesspal.fooditem import FoodItem
+
+    nutrient_props = [
+        "calcium", "carbohydrates", "cholesterol", "fat", "fiber", "iron",
+        "monounsaturated_fat", "polyunsaturated_fat", "potassium", "protein",
+        "saturated_fat", "sodium", "sugar", "trans_fat", "vitamin_a", "vitamin_c",
+    ]
+    for name in nutrient_props:
+        setattr(FoodItem, name, property(lambda self, _n=name: self.details.get(_n)))
+
+
+_patch_myfitnesspal_fooditem_missing_nutrients()
+
 # Initialize MCP server
 mcp = FastMCP("myfitnesspal_mcp")
 
@@ -88,10 +110,36 @@ def save_cookies(cookies: Dict[str, str]):
     logger.info(f"Saved session cookies to {COOKIES_FILE}")
 
 
+def seed_cookies_from_env():
+    """
+    Write MFP_COOKIES_JSON (the same {"cookies": {...}, "saved_at": ...}
+    blob produced by save_cookies()) to COOKIES_FILE if present.
+
+    Railway's filesystem is ephemeral and has no browser to extract cookies
+    from, so headless deployments provision the session this way instead.
+    Only writes if COOKIES_FILE doesn't already exist, so a live-refreshed
+    session surviving a process restart (without a redeploy) isn't clobbered
+    by a stale env var.
+    """
+    raw = os.environ.get("MFP_COOKIES_JSON")
+    if not raw or COOKIES_FILE.exists():
+        return
+    try:
+        cookie_data = json.loads(raw)
+    except json.JSONDecodeError as e:
+        logger.error(f"MFP_COOKIES_JSON is not valid JSON: {e}")
+        return
+    ensure_config_dir()
+    with open(COOKIES_FILE, "w") as f:
+        json.dump(cookie_data, f, indent=2)
+    COOKIES_FILE.chmod(0o600)
+    logger.info(f"Seeded {COOKIES_FILE} from MFP_COOKIES_JSON")
+
+
 def load_cookies() -> Optional[Dict[str, str]]:
     """
     Load session cookies from file.
-    
+
     Returns:
         Dictionary of cookies if file exists and is valid, None otherwise
     """
@@ -1595,11 +1643,14 @@ def add_food_to_diary(
     food = get_food_v2(client, mfp_id)
     serving_size = select_serving_size(food, unit)
 
-    meal_name = meal.strip().capitalize()
-    if meal_name not in VALID_MEALS:
-        raise RuntimeError(
-            f"Invalid meal {meal!r}. Expected one of: {', '.join(VALID_MEALS)}"
-        )
+    # VALID_MEALS covers MFP's stock defaults, but accounts can rename/add
+    # meal slots (e.g. "Pre Workout", "Intra Workout") in MFP settings ->
+    # Meal Names. Those custom names are only known to MFP itself, so accept
+    # any non-empty meal name here and let the diary API be the source of
+    # truth rather than hard-rejecting names outside the stock four.
+    meal_name = meal.strip().title()
+    if not meal_name:
+        raise RuntimeError("Meal name cannot be empty")
 
     entry = {
         "type": "food_entry",
@@ -2326,8 +2377,9 @@ async def mfp_add_food_to_diary(params: AddFoodToDiaryInput) -> str:
         client = get_mfp_client()
         target_date = parse_date(params.date)
         
-        # Normalize meal name (capitalize first letter)
-        meal = params.meal.strip().capitalize()
+        # Normalize meal name. .title() (not .capitalize()) so multi-word
+        # custom meal names like "Pre Workout" keep every word capitalized.
+        meal = params.meal.strip().title()
         if meal.lower() == "snack":
             meal = "Snacks"
         
@@ -2830,9 +2882,87 @@ async def mfp_delete_custom_food(params: DeleteCustomFoodInput) -> str:
         return f"Error deleting custom food: {str(e)}"
 
 
+def _build_http_app():
+    """
+    Wrap the FastMCP streamable-http ASGI app with:
+      - an unauthenticated GET /health for Railway's healthcheck
+      - a bearer-token check (MFP_AUTH_TOKEN) on everything else, since this
+        endpoint is a public URL with full read/write access to the diary
+    """
+    from starlette.applications import Starlette
+    from starlette.responses import Response, PlainTextResponse
+    from starlette.routing import Mount, Route
+
+    token = os.environ.get("MFP_AUTH_TOKEN")
+    if not token:
+        logger.warning(
+            "MFP_AUTH_TOKEN is not set -- the HTTP endpoint will accept "
+            "unauthenticated requests. Set it before exposing this publicly."
+        )
+
+    mcp_app = mcp.streamable_http_app()
+
+    class BearerAuthMiddleware:
+        def __init__(self, app, expected_token):
+            self.app = app
+            self.expected_token = expected_token
+
+        async def __call__(self, scope, receive, send):
+            if scope["type"] != "http" or not self.expected_token:
+                await self.app(scope, receive, send)
+                return
+            headers = dict(scope.get("headers") or [])
+            auth = headers.get(b"authorization", b"").decode()
+            if auth != f"Bearer {self.expected_token}":
+                response = Response("Unauthorized", status_code=401)
+                await response(scope, receive, send)
+                return
+            await self.app(scope, receive, send)
+
+    return Starlette(
+        routes=[
+            Route("/health", lambda request: PlainTextResponse("ok")),
+            Mount("/", app=BearerAuthMiddleware(mcp_app, token)),
+        ],
+        # mcp_app's own lifespan starts its StreamableHTTPSessionManager's
+        # task group; Mount doesn't propagate a sub-app's lifespan, so this
+        # wrapper app must trigger it explicitly or every request 500s with
+        # "Task group is not initialized".
+        lifespan=mcp_app.router.lifespan_context,
+    )
+
+
 def main():
-    """Run the MCP server."""
-    mcp.run()
+    """Run the MCP server.
+
+    Transport is selected via MFP_TRANSPORT ("stdio", default; or
+    "streamable-http" for a hosted/cloud deployment reachable by remote MCP
+    clients such as Claude's voice mode). stdio behavior is unchanged.
+    """
+    transport = os.environ.get("MFP_TRANSPORT", "stdio")
+
+    if transport == "streamable-http":
+        import uvicorn
+
+        seed_cookies_from_env()
+
+        mcp.settings.host = "0.0.0.0"
+        mcp.settings.port = int(os.environ.get("PORT", 8000))
+
+        public_host = os.environ.get("MFP_PUBLIC_HOST")
+        if public_host:
+            mcp.settings.transport_security.allowed_hosts.append(public_host)
+            mcp.settings.transport_security.allowed_origins.append(f"https://{public_host}")
+        else:
+            logger.warning(
+                "MFP_PUBLIC_HOST is not set -- transport_security will "
+                "reject requests to any host other than localhost."
+            )
+
+        app = _build_http_app()
+        uvicorn.run(app, host=mcp.settings.host, port=mcp.settings.port, log_level="info")
+    else:
+        mcp.run()
 
 
 if __name__ == "__main__":

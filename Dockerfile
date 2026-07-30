@@ -1,11 +1,16 @@
 # MyFitnessPal MCP Server
-# 
-# NOTE: This MCP uses browser cookie authentication by default.
-# For Docker deployment, you'll need to mount your browser's cookie database
-# or use an alternative authentication method.
 #
-# Build: docker build -t mfp-mcp .
-# Run: docker run -it --rm -v ~/.config/google-chrome:/root/.config/google-chrome:ro mfp-mcp
+# Transport is selected at runtime via MFP_TRANSPORT (unset/"stdio" default,
+# "streamable-http" for a hosted deployment -- see README "Cloud Deployment").
+#
+# Local stdio (mounts a browser's cookie database for auth):
+#   docker build -t mfp-mcp .
+#   docker run -it --rm -v ~/.config/google-chrome:/root/.config/google-chrome:ro mfp-mcp
+#
+# Hosted streamable-http (auth via MFP_COOKIES_JSON instead -- no browser):
+#   docker run -p 8000:8000 \
+#     -e MFP_TRANSPORT=streamable-http -e MFP_AUTH_TOKEN=... -e MFP_PUBLIC_HOST=... \
+#     -e MFP_COOKIES_JSON="$(cat ~/.mfp_mcp/cookies.json)" mfp-mcp
 
 FROM python:3.12-slim
 
@@ -35,8 +40,8 @@ RUN pip install --no-cache-dir -e .
 RUN useradd --create-home --shell /bin/bash mcp
 USER mcp
 
-# Expose default port (for HTTP transport if needed)
+# Port used when MFP_TRANSPORT=streamable-http (Railway overrides via $PORT)
 EXPOSE 8000
 
-# Default command runs the MCP server with stdio transport
+# main() picks stdio vs streamable-http from MFP_TRANSPORT at runtime
 ENTRYPOINT ["python", "-m", "mfp_mcp.server"]

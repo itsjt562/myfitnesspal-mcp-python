@@ -526,6 +526,62 @@ docker run -it --rm \
   mfp-mcp
 ```
 
+## Cloud Deployment (Railway, for voice-mode access)
+
+The stdio setup above only works with clients running on the same machine
+(Claude Desktop, Claude Code). Claude's voice mode (mobile/desktop) only
+reaches **remote** MCP servers registered as custom connectors via claude.ai
+-- that requires a hosted HTTP endpoint instead of stdio.
+
+### 1. Get a cookie set
+
+There's no browser on a cloud server, so auth is seeded from a cookie blob
+captured locally first: log into myfitnesspal.com in a browser, run any
+local tool call once (this is the same `~/.mfp_mcp/cookies.json` used for
+stdio), then:
+
+```bash
+cat ~/.mfp_mcp/cookies.json   # this whole file is MFP_COOKIES_JSON below
+```
+
+### 2. Deploy
+
+```bash
+railway link       # point at an existing project, or `railway init` a new one
+railway up
+```
+
+### 3. Set Railway variables
+
+| Variable | Value |
+|---|---|
+| `MFP_TRANSPORT` | `streamable-http` |
+| `MFP_COOKIES_JSON` | contents of `~/.mfp_mcp/cookies.json` (step 1) |
+| `MFP_AUTH_TOKEN` | a long random string (`openssl rand -hex 32`) -- required, or the endpoint accepts unauthenticated requests |
+| `MFP_PUBLIC_HOST` | the Railway domain once generated (step 4), e.g. `mfp-mcp-production.up.railway.app` |
+
+### 4. Generate a public domain
+
+Railway dashboard -> Settings -> Networking -> Generate Domain. Set that
+value as `MFP_PUBLIC_HOST` (step 3) and redeploy -- `transport_security`
+rejects every request to an unlisted host, so this must be set before the
+connector will work.
+
+### 5. Register as a custom connector in claude.ai
+
+claude.ai -> Settings -> Connectors -> Add custom connector. URL is
+`https://<MFP_PUBLIC_HOST>/mcp`, with an `Authorization: Bearer <MFP_AUTH_TOKEN>`
+header. Once connected, voice mode on mobile/desktop can call these tools
+directly.
+
+### Cookie lifetime in the cloud
+
+Untested: whether `MFP_COOKIES_JSON`'s session survives unattended for
+hours/days without a browser present to refresh Cloudflare's short-lived
+`cf_clearance` cookie (~30 min lifetime observed). If the deployed server
+starts failing auth, that's the signal -- re-grab a fresh cookie set (step 1)
+and update the `MFP_COOKIES_JSON` variable.
+
 ## Troubleshooting
 
 ### "python: command not found" or wrong Python version
