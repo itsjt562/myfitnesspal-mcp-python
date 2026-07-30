@@ -1577,6 +1577,83 @@ def get_food_v2(client, mfp_id: str) -> Dict[str, Any]:
     return items[0]
 
 
+# ============================================================================
+# Body measurements (v2 JSON API)
+#
+# myfitnesspal.Client.get_measurements()/set_measurements() scrape the
+# /measurements page's embedded __NEXT_DATA__ for a "dehydratedState" key
+# that no longer exists there (verified 2026-07: the page now ships only
+# {"userHasIncompleteSession": false} -- MFP moved this page to client-side
+# data fetching, same restructuring that killed the old food-diary-add HTML
+# endpoint). get_measurements() raises KeyError('dehydratedState');
+# set_measurements() IndexErrors on an authenticity_token xpath that no
+# longer matches anything. Both are 100% broken, not just occasionally.
+#
+# Fixed by talking to the same authenticated JSON API the current web app
+# actually uses, GET/POST/DELETE https://api.myfitnesspal.com/v2/measurements
+# -- verified live: full create/read/delete round trip against this account.
+# ============================================================================
+
+
+def get_measurements_v2(
+    client, measurement: str, start: date, end: date
+) -> List[Dict[str, Any]]:
+    """Fetch raw measurement entries of `measurement` type between two dates."""
+    r = client.session.get(
+        f"{MFP_API_BASE}/v2/measurements",
+        headers=_mfp_api_headers(client),
+        params={
+            "type": measurement,
+            "from": start.strftime("%Y-%m-%d"),
+            "to": end.strftime("%Y-%m-%d"),
+        },
+        timeout=30,
+    )
+    if r.status_code != 200:
+        raise RuntimeError(f"Could not get measurements: HTTP {r.status_code}")
+    return r.json().get("items") or []
+
+
+def set_measurement_v2(client, measurement: str, value: float, target_date: date) -> Dict[str, Any]:
+    """Create a measurement entry via the v2 API.
+
+    MFP requires a `unit` on write (e.g. "pounds" for Weight) but doesn't
+    infer it, and guessing wrong would silently store the value under the
+    wrong unit. Reuses the unit of this measurement type's most recent
+    existing entry; only guesses "pounds" as a last resort for a brand-new
+    Weight measurement with no history at all.
+    """
+    existing = get_measurements_v2(client, measurement, date(1970, 1, 1), date.today())
+    if existing:
+        unit = sorted(existing, key=lambda e: e.get("date", ""))[-1].get("unit")
+    elif measurement == "Weight":
+        unit = "pounds"
+    else:
+        unit = None
+
+    item: Dict[str, Any] = {
+        "type": measurement,
+        "value": value,
+        "date": target_date.strftime("%Y-%m-%d"),
+    }
+    if unit:
+        item["unit"] = unit
+
+    r = client.session.post(
+        f"{MFP_API_BASE}/v2/measurements",
+        headers=_mfp_api_headers(client, json_body=True),
+        data=json.dumps({"items": [item]}),
+        timeout=30,
+    )
+    if r.status_code not in (200, 201):
+        detail = _api_error_detail(r)
+        raise RuntimeError(
+            f"Failed to set measurement: HTTP {r.status_code}"
+            + (f" - {detail}" if detail else "")
+        )
+    return r.json()["items"][0]
+
+
 # Canonical measurement-unit token -> what any of these words/abbreviations mean.
 # Deliberately does NOT include "container", "pack", "bag", etc: those are
 # count units whose real weight/volume is only described in free text (e.g.
@@ -1904,7 +1981,7 @@ def delete_custom_food(client, food_id: str) -> int:
 
 def add_food_to_diary(
     client, mfp_id: str, meal: str, target_date: date, quantity: float = 1.0, unit: str = "serving"
-) -> Optional[str]:
+) -> Tuple[Optional[str], str]:
     """
     Add a food item to the diary for a specific date and meal.
 
@@ -1917,7 +1994,11 @@ def add_food_to_diary(
         unit: Unit to log in (e.g. "oz", "g"), or "serving" for a raw serving count
 
     Returns:
-        The new entry's UUID, or None if MFP did not return one
+        (entry_id, food_name) -- entry_id is None if MFP did not return one.
+        food_name comes from the same v2 record used to build the diary
+        entry (not a separate legacy lookup, which frequently reports
+        "Unknown Food" for foods -- e.g. most custom/generic entries --
+        that the legacy endpoint doesn't resolve).
 
     Raises:
         RuntimeError: If the operation fails
@@ -1987,13 +2068,17 @@ def add_food_to_diary(
         f"to {meal_name} for {target_date}"
     )
 
+    description = food.get("description") or "Food item"
+    brand_name = food.get("brand_name")
+    food_name = f"{brand_name} - {description}" if brand_name else description
+
     # MFP returns the new entry's id here and nowhere else - the diary page
     # exposes only legacy numeric ids, which the v2 API does not accept.
     try:
-        return response.json()["items"][0]["id"]
+        return response.json()["items"][0]["id"], food_name
     except (ValueError, KeyError, IndexError):
         logger.warning("Entry created but MyFitnessPal returned no entry id")
-        return None
+        return None, food_name
 
 
 def list_diary_entries(client, target_date: date) -> List[Dict[str, str]]:
@@ -2077,73 +2162,69 @@ def remove_food_entry(client, entry_id: str) -> None:
 def set_water_intake(client, target_date: date, cups: float) -> None:
     """
     Set water intake for a specific date.
-    
+
+    BROKEN UPSTREAM (verified 2026-07): the legacy endpoint this posts to,
+    POST /food/diary/{username}/water, now 404s ("Page not found") -- MFP
+    retired it, same as the old food-diary-add HTML endpoint. A live search
+    for a v2 JSON replacement (api.myfitnesspal.com/v2/water, a
+    "water_entry"/"water" item type on the v2/diary items endpoint that
+    handles food entries) turned up nothing; MFP's current web client must
+    write water through a mechanism this hasn't identified yet. Left wired
+    up (rather than deleted) so it's one place to fix if that mechanism
+    surfaces, but it will always raise until then.
+
     Args:
         client: Authenticated myfitnesspal.Client instance
         target_date: Date to set water intake
         cups: Number of cups of water
-    
+
     Raises:
-        RuntimeError: If the operation fails
+        RuntimeError: Always, until a working write endpoint is found.
     """
     from urllib import parse
-    
-    try:
-        # Get the diary page for the target date to extract CSRF token
-        date_str = target_date.strftime("%Y-%m-%d")
-        diary_url = parse.urljoin(
-            client.BASE_URL_SECURE,
-            f"food/diary/{client.effective_username}?date={date_str}"
+
+    date_str = target_date.strftime("%Y-%m-%d")
+    diary_url = parse.urljoin(
+        client.BASE_URL_SECURE,
+        f"food/diary/{client.effective_username}?date={date_str}"
+    )
+    document = client._get_document_for_url(diary_url)
+    authenticity_token = document.xpath(
+        "(//input[@name='authenticity_token']/@value)[1]"
+    )
+    if not authenticity_token:
+        raise RuntimeError(
+            "Setting water intake is currently broken: MyFitnessPal retired "
+            "the endpoint this used to write to, and no working replacement "
+            "has been found. Log water directly in the MyFitnessPal app for now."
         )
-        
-        # Use the library's method to get the document
-        document = client._get_document_for_url(diary_url)
-        
-        # Extract authenticity token
-        authenticity_token = document.xpath(
-            "(//input[@name='authenticity_token']/@value)[1]"
+    authenticity_token = authenticity_token[0]
+
+    water_url = parse.urljoin(
+        client.BASE_URL_SECURE,
+        f"food/diary/{client.effective_username}/water"
+    )
+    post_data = {
+        "authenticity_token": authenticity_token,
+        "date": date_str,
+        "water": str(cups),
+    }
+    headers = {
+        "Referer": diary_url,
+        "Content-Type": "application/x-www-form-urlencoded",
+        "X-Requested-With": "XMLHttpRequest",
+    }
+    response = client.session.post(water_url, data=post_data, headers=headers)
+
+    if response.status_code != 200:
+        raise RuntimeError(
+            "Setting water intake is currently broken: MyFitnessPal retired "
+            f"the endpoint this used to write to (HTTP {response.status_code}), "
+            "and no working replacement has been found. Log water directly in "
+            "the MyFitnessPal app for now."
         )
-        if not authenticity_token:
-            raise RuntimeError("Could not find authenticity token on diary page")
-        authenticity_token = authenticity_token[0]
-        
-        # Build the URL for setting water
-        # MyFitnessPal uses /food/diary/{username}/water endpoint
-        water_url = parse.urljoin(
-            client.BASE_URL_SECURE,
-            f"food/diary/{client.effective_username}/water"
-        )
-        
-        # Prepare the data for the POST request
-        post_data = {
-            "authenticity_token": authenticity_token,
-            "date": date_str,
-            "water": str(cups),
-        }
-        
-        # Set water intake
-        headers = {
-            "Referer": diary_url,
-            "Content-Type": "application/x-www-form-urlencoded",
-            "X-Requested-With": "XMLHttpRequest",
-        }
-        
-        response = client.session.post(water_url, data=post_data, headers=headers)
-        response.raise_for_status()
-        
-        if response.status_code != 200:
-            raise RuntimeError(f"Failed to set water: HTTP {response.status_code}")
-        
-        logger.info(f"Successfully set water intake to {cups} cups for {target_date}")
-        
-    except Exception as e:
-        # Don't expose internal error details to avoid leaking sensitive information
-        error_msg = str(e)
-        # Only include safe error information
-        if "HTTP" in error_msg or "status" in error_msg.lower():
-            raise RuntimeError(f"Failed to set water intake: {error_msg}")
-        else:
-            raise RuntimeError("Failed to set water intake. Please check your authentication and try again.")
+
+    logger.info(f"Successfully set water intake to {cups} cups for {target_date}")
 
 
 # ============================================================================
@@ -2259,7 +2340,14 @@ async def mfp_search_food(params: SearchFoodInput) -> str:
                     "brand": item.brand,
                     "serving": item.serving,
                     "calories": item.calories,
-                    "mfp_id": item.mfp_id,
+                    # str(), not the library's raw int -- every downstream
+                    # tool (mfp_get_food_details, mfp_add_food_to_diary, ...)
+                    # requires mfp_id as a string and 422s on a bare int, so
+                    # an int here breaks the natural search -> details/add
+                    # chain (verified bug, 2026-07: pydantic
+                    # "Input should be a valid string" on the first search
+                    # result's mfp_id fed straight into mfp_get_food_details).
+                    "mfp_id": str(item.mfp_id),
                 }
             )
 
@@ -2374,26 +2462,31 @@ async def mfp_get_measurements(params: GetMeasurementsInput) -> str:
         else:
             start = end - timedelta(days=30)
 
-        measurements = client.get_measurements(params.measurement, start, end)
+        items = get_measurements_v2(client, params.measurement, start, end)
+        # Sort ascending by date so "earliest"/"latest" below are actually
+        # chronological, not just first/last-inserted.
+        items.sort(key=lambda e: e.get("date", ""))
+        values_by_date = {e["date"]: e["value"] for e in items}
 
         data = {
             "measurement_type": params.measurement,
             "start_date": str(start),
             "end_date": str(end),
-            "count": len(measurements),
-            "values": ordered_dict_to_dict(measurements),
+            "count": len(items),
+            "values": values_by_date,
         }
 
         # Calculate summary stats if we have data
-        if measurements:
-            values = list(measurements.values())
+        if items:
+            values = [e["value"] for e in items]
             data["summary"] = {
-                "latest": values[-1] if values else None,
-                "earliest": values[0] if values else None,
+                "latest": values[-1],
+                "earliest": values[0],
                 "change": round(values[-1] - values[0], 2) if len(values) >= 2 else 0,
                 "min": min(values),
                 "max": max(values),
                 "average": round(sum(values) / len(values), 2),
+                "unit": items[-1].get("unit"),
             }
 
         return format_response(
@@ -2430,7 +2523,7 @@ async def mfp_set_measurement(params: SetMeasurementInput) -> str:
     """
     try:
         client = get_mfp_client()
-        client.set_measurements(params.measurement, params.value)
+        created = set_measurement_v2(client, params.measurement, params.value, date.today())
 
         return json.dumps(
             {
@@ -2438,6 +2531,7 @@ async def mfp_set_measurement(params: SetMeasurementInput) -> str:
                 "message": f"Successfully logged {params.measurement}: {params.value}",
                 "measurement": params.measurement,
                 "value": params.value,
+                "unit": created.get("unit"),
                 "date": str(date.today()),
             },
             indent=2,
@@ -2552,8 +2646,15 @@ async def mfp_set_goals(params: SetGoalsInput) -> str:
     """
     Update daily nutrition goals (calories, protein, carbs, fat).
 
-    Sets new daily targets for the specified nutrients. Only updates the
-    values that are provided; others remain unchanged.
+    Sets new daily targets for the specified nutrients; unprovided fields
+    keep their current value (backfilled from today's existing goal, since
+    MyFitnessPal's own update endpoint requires a calorie value on every
+    call). NOT exact or idempotent: MFP recalculates and rounds the full
+    goal set on every write (its own client library notes "values will be
+    adjusted and rounded by MFP if no premium subscription is applied"),
+    verified live 2026-07 -- sending the exact same 4 values back can still
+    shift calories/protein/carbs by a few units each call. Expect the result
+    to land close to, not exactly at, the requested numbers.
 
     Args:
         params: SetGoalsInput containing:
@@ -2566,23 +2667,39 @@ async def mfp_set_goals(params: SetGoalsInput) -> str:
         str: Confirmation message with updated goals
     """
     try:
-        # Check that at least one goal is provided
-        if not any(
-            [params.calories, params.protein, params.carbohydrates, params.fat]
+        # Check that at least one goal is provided. `is not None` (not
+        # truthiness) -- protein/carbohydrates/fat all allow 0 as a
+        # deliberate value (ge=0), and a falsy check would silently drop it.
+        if all(
+            v is None
+            for v in (params.calories, params.protein, params.carbohydrates, params.fat)
         ):
             return "Error: Please provide at least one goal to update (calories, protein, carbohydrates, or fat)"
 
         client = get_mfp_client()
 
-        # Build kwargs for set_new_goal
-        kwargs = {}
-        if params.calories:
-            kwargs["energy"] = params.calories
-        if params.protein:
+        # client.set_new_goal()'s `energy` parameter is required with no
+        # default (verified 2026-07: omitting it raises "missing 1 required
+        # positional argument: 'energy'"), even though this tool's contract
+        # is "only updates the values provided". Fill it from the current
+        # goal so a protein/carbs/fat-only update doesn't crash or
+        # accidentally reset calories.
+        energy = params.calories
+        if energy is None:
+            current = client.get_date(date.today()).goals
+            energy = current.get("calories") or current.get("energy")
+            if energy is None:
+                return (
+                    "Error: could not read a current calorie goal to preserve "
+                    "it -- pass `calories` explicitly."
+                )
+
+        kwargs = {"energy": energy}
+        if params.protein is not None:
             kwargs["protein"] = params.protein
-        if params.carbohydrates:
+        if params.carbohydrates is not None:
             kwargs["carbohydrates"] = params.carbohydrates
-        if params.fat:
+        if params.fat is not None:
             kwargs["fat"] = params.fat
 
         client.set_new_goal(**kwargs)
@@ -2688,8 +2805,12 @@ async def mfp_add_food_to_diary(params: AddFoodToDiaryInput) -> str:
         if meal.lower() == "snack":
             meal = "Snacks"
         
-        # Add food to diary
-        entry_id = add_food_to_diary(
+        # Add food to diary. food_name comes back from the same v2 record
+        # used to build the entry -- the legacy client.get_food_item_details
+        # lookup this used to make separately for the confirmation message
+        # frequently returned "Unknown Food" for custom/generic entries it
+        # doesn't resolve, even though the entry itself logged correctly.
+        entry_id, food_name = add_food_to_diary(
             client=client,
             mfp_id=params.mfp_id,
             meal=meal,
@@ -2697,13 +2818,6 @@ async def mfp_add_food_to_diary(params: AddFoodToDiaryInput) -> str:
             quantity=params.quantity,
             unit=params.unit,
         )
-
-        # Get food details for confirmation
-        try:
-            food_item = client.get_food_item_details(params.mfp_id)
-            food_name = getattr(food_item, "description", "Unknown Food")
-        except Exception:
-            food_name = "Food item"
 
         return json.dumps(
             {
@@ -2940,6 +3054,20 @@ async def mfp_get_report(params: GetReportInput) -> str:
         )
 
     except Exception as e:
+        # The legacy /reports/results/{category}/{name}/{days}.json endpoint
+        # this calls into is retired upstream (verified 2026-07: 404, no
+        # JSON body). A live search for a v2 JSON replacement turned up
+        # nothing, so this fails every time with a cryptic
+        # JSONDecodeError("Expecting value...") from parsing the 404's HTML
+        # body as JSON. Give an honest message and point at working
+        # alternatives instead of surfacing that raw parse error.
+        if isinstance(e, json.JSONDecodeError) or "Expecting value" in str(e):
+            return (
+                "mfp_get_report is currently broken: MyFitnessPal retired the "
+                "endpoint this relies on, and no working replacement has been "
+                "found. Use mfp_get_diary for a single day's totals, or "
+                "mfp_get_measurements for a value trend over a date range."
+            )
         return f"Error getting report: {str(e)}"
 
 
