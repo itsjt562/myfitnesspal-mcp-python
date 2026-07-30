@@ -1355,18 +1355,24 @@ class AddFoodToDiaryInput(BaseModel):
     quantity: float = Field(
         default=1.0,
         description=(
-            "Amount to log. If `unit` is set, this is the TOTAL target amount in "
-            "that unit (e.g. quantity=8, unit='oz' for '8 oz of chicken breast' -- "
-            "pass the real-world amount directly, do not pre-divide by a serving "
-            "size). If `unit` is omitted, this is the number of the food's default "
-            "serving (e.g. 1.5 for 1.5 servings)."
+            "The TOTAL real-world amount to log, in `unit` (e.g. quantity=8, "
+            "unit='oz' for '8 oz of chicken breast'). Pass the actual amount "
+            "directly -- never pre-divide by a serving size. To log by serving "
+            "count instead, set unit='serving' and quantity=number of servings."
         ),
         gt=0,
         le=5000,
     )
-    unit: Optional[str] = Field(
-        default=None,
-        description="Unit to log the quantity in (e.g. 'oz', 'g', 'cup', 'ml'). Matched against the food's known serving units; quantity is the total amount in this unit, not a serving count.",
+    unit: str = Field(
+        ...,
+        description=(
+            "REQUIRED. Unit for `quantity` (e.g. 'oz', 'g', 'cup', 'ml'), matched "
+            "against the food's known serving units -- quantity is the total "
+            "amount in this unit, not a serving count. Pass unit='serving' only "
+            "if you explicitly mean N servings of the food's default serving "
+            "size (rare -- most real-world amounts should use a weight/volume "
+            "unit instead, since a food's 'serving' can itself be several oz/g)."
+        ),
     )
 
 
@@ -1831,7 +1837,7 @@ def delete_custom_food(client, food_id: str) -> int:
 
 
 def add_food_to_diary(
-    client, mfp_id: str, meal: str, target_date: date, quantity: float = 1.0, unit: Optional[str] = None
+    client, mfp_id: str, meal: str, target_date: date, quantity: float = 1.0, unit: str = "serving"
 ) -> Optional[str]:
     """
     Add a food item to the diary for a specific date and meal.
@@ -1841,8 +1847,8 @@ def add_food_to_diary(
         mfp_id: MyFitnessPal food item ID
         meal: Meal name (Breakfast, Lunch, Dinner, Snacks)
         target_date: Date to add the food entry
-        quantity: Number of servings (default 1.0)
-        unit: Optional serving unit to log against (e.g. "oz")
+        quantity: Total amount in `unit` (or serving count if unit="serving")
+        unit: Unit to log in (e.g. "oz", "g"), or "serving" for a raw serving count
 
     Returns:
         The new entry's UUID, or None if MFP did not return one
@@ -1850,8 +1856,9 @@ def add_food_to_diary(
     Raises:
         RuntimeError: If the operation fails
     """
+    is_serving_count = unit.strip().lower() in ("serving", "servings", "srv", "")
     food = get_food_v2(client, mfp_id)
-    serving_size = select_serving_size(food, unit)
+    serving_size = select_serving_size(food, None if is_serving_count else unit)
 
     # VALID_MEALS covers MFP's stock defaults, but accounts can rename/add
     # meal slots (e.g. "Pre Workout", "Intra Workout") in MFP settings ->
@@ -1864,15 +1871,17 @@ def add_food_to_diary(
 
     # MFP's `servings` field is a multiplier against the CHOSEN serving
     # record's own base amount, not the raw target quantity -- a food can
-    # have a "4.00 x oz" record instead of "1.00 x oz". When a unit is given,
-    # `quantity` means the total target amount in that unit (e.g. 8 for
-    # "8 oz"), so divide by the record's base value to get the multiplier
-    # MFP actually wants. Passing quantity straight through silently
-    # inflated logged amounts by the record's multiplier (verified bug,
-    # 2026-07: "8 oz" of ground beef logged as 32 oz). Without a unit,
-    # quantity keeps its old meaning: number of the food's default serving.
+    # have a "4.00 x oz" record instead of "1.00 x oz". `quantity` means the
+    # total target amount in `unit` (e.g. 8 for "8 oz"), so divide by the
+    # record's base value to get the multiplier MFP actually wants. Passing
+    # quantity straight through silently inflated logged amounts by the
+    # record's multiplier (verified bug, 2026-07: "4 oz" of 93/7 ground beef,
+    # whose only serving record is "4.00 x oz", logged as 16 oz because the
+    # caller omitted `unit` and quantity=4 was taken as "4 servings").
+    # unit="serving" is the one deliberate exception: quantity IS the raw
+    # servings count against the food's default serving record.
     servings = float(quantity)
-    if unit:
+    if not is_serving_count:
         base_value = float(serving_size["value"]) or 1.0
         servings = float(quantity) / base_value
 
@@ -1908,7 +1917,7 @@ def add_food_to_diary(
 
     logger.info(
         f"Added food {mfp_id} ({serving_size['value']} {serving_size['unit']} "
-        f"x{servings:.4f} servings, target {quantity} {unit or serving_size['unit']}) "
+        f"x{servings:.4f} servings, requested quantity={quantity} unit={unit!r}) "
         f"to {meal_name} for {target_date}"
     )
 
@@ -2592,11 +2601,13 @@ async def mfp_add_food_to_diary(params: AddFoodToDiaryInput) -> str:
             - mfp_id (str): MyFitnessPal food item ID (from mfp_search_food)
             - meal (str): Meal name - 'Breakfast', 'Lunch', 'Dinner', or 'Snacks' (default: 'Breakfast')
             - date (str, optional): Date in YYYY-MM-DD format, defaults to today
-            - quantity (float): Total amount in `unit` (e.g. 8 for "8 oz"), or number
-              of default servings if `unit` is omitted (default: 1.0)
-            - unit (str, optional): Unit to log in (e.g. 'oz', 'g', 'cup'). Pass the
-              real-world amount in `quantity` directly -- this tool converts it to
-              MFP's internal serving-count math itself.
+            - quantity (float): Total real-world amount in `unit` (e.g. 8 for "8 oz").
+              Pass the actual amount directly -- this tool converts it to MFP's
+              internal serving-count math itself, never pre-divide it yourself.
+            - unit (str, REQUIRED): Unit for quantity (e.g. 'oz', 'g', 'cup', 'ml').
+              Use unit='serving' only to mean N servings of the food's default
+              serving size -- most real amounts should use a weight/volume unit
+              instead, since a food's "1 serving" can itself be several oz/g.
 
     Returns:
         str: Confirmation message with details of the added food entry
