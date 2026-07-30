@@ -32,8 +32,20 @@ import time
 from cryptography.fernet import Fernet
 import keyring
 
+import secrets
+
 import httpx
 from mcp.server.fastmcp import FastMCP
+from mcp.server.auth.provider import (
+    AccessToken,
+    AuthorizationCode,
+    AuthorizationParams,
+    OAuthAuthorizationServerProvider,
+    RefreshToken,
+    construct_redirect_uri,
+)
+from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions, RevocationOptions
+from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
 from pydantic import BaseModel, Field, ConfigDict, field_validator
 
 # Configure logging to stderr (required for stdio transport)
@@ -66,8 +78,200 @@ def _patch_myfitnesspal_fooditem_missing_nutrients():
 
 _patch_myfitnesspal_fooditem_missing_nutrients()
 
-# Initialize MCP server
-mcp = FastMCP("myfitnesspal_mcp")
+
+ACCESS_TOKEN_TTL_SECONDS = 60 * 60 * 24 * 30  # 30 days
+AUTH_CODE_TTL_SECONDS = 300  # 5 minutes
+
+
+class SingleUserOAuthProvider(OAuthAuthorizationServerProvider):
+    """
+    Minimal single-tenant OAuth authorization server.
+
+    claude.ai's remote-MCP connector flow requires real OAuth (dynamic client
+    registration + authorization code + PKCE) -- a static bearer header isn't
+    enough for it to register. There's exactly one real user here (whoever
+    holds MFP_AUTH_TOKEN), so /authorize is gated by that shared secret via a
+    one-field consent form (see the /authorize/approve custom routes below)
+    instead of a real login system.
+
+    All state is in-memory -- fine for a single Railway instance; a restart
+    just means reconnecting the claude.ai connector once. The framework
+    (mcp.server.auth.handlers) already handles PKCE verification, redirect_uri
+    matching, and expiry checks before calling into this provider -- see
+    https://py.sdk.modelcontextprotocol.io for the OAuthAuthorizationServerProvider contract.
+    """
+
+    def __init__(self, shared_secret: str):
+        self.shared_secret = shared_secret
+        self.clients: Dict[str, OAuthClientInformationFull] = {}
+        self.pending_authorizations: Dict[str, AuthorizationParams] = {}
+        self.pending_client_ids: Dict[str, str] = {}
+        self.auth_codes: Dict[str, AuthorizationCode] = {}
+        self.access_tokens: Dict[str, AccessToken] = {}
+        self.refresh_tokens: Dict[str, RefreshToken] = {}
+
+    async def get_client(self, client_id: str) -> Optional[OAuthClientInformationFull]:
+        return self.clients.get(client_id)
+
+    async def register_client(self, client_info: OAuthClientInformationFull) -> None:
+        self.clients[client_info.client_id] = client_info
+
+    async def authorize(self, client: OAuthClientInformationFull, params: AuthorizationParams) -> str:
+        request_id = secrets.token_urlsafe(16)
+        self.pending_authorizations[request_id] = params
+        self.pending_client_ids[request_id] = client.client_id
+        return f"/authorize/approve?request_id={request_id}"
+
+    def complete_authorization(self, request_id: str) -> Optional[str]:
+        """Called by the /authorize/approve POST handler once the shared
+        secret has been verified. Returns the final redirect URL back to the
+        client (with the issued code), or None if request_id is unknown."""
+        params = self.pending_authorizations.pop(request_id, None)
+        client_id = self.pending_client_ids.pop(request_id, None)
+        if params is None or client_id is None:
+            return None
+        code = secrets.token_urlsafe(32)
+        self.auth_codes[code] = AuthorizationCode(
+            code=code,
+            scopes=params.scopes or [],
+            expires_at=time.time() + AUTH_CODE_TTL_SECONDS,
+            client_id=client_id,
+            code_challenge=params.code_challenge,
+            redirect_uri=params.redirect_uri,
+            redirect_uri_provided_explicitly=params.redirect_uri_provided_explicitly,
+        )
+        return construct_redirect_uri(str(params.redirect_uri), code=code, state=params.state)
+
+    async def load_authorization_code(
+        self, client: OAuthClientInformationFull, authorization_code: str
+    ) -> Optional[AuthorizationCode]:
+        code = self.auth_codes.get(authorization_code)
+        if code is None or code.client_id != client.client_id:
+            return None
+        return code
+
+    async def exchange_authorization_code(
+        self, client: OAuthClientInformationFull, authorization_code: AuthorizationCode
+    ) -> OAuthToken:
+        self.auth_codes.pop(authorization_code.code, None)  # single use
+        return self._issue_tokens(client.client_id, authorization_code.scopes)
+
+    async def load_refresh_token(
+        self, client: OAuthClientInformationFull, refresh_token: str
+    ) -> Optional[RefreshToken]:
+        token = self.refresh_tokens.get(refresh_token)
+        if token is None or token.client_id != client.client_id:
+            return None
+        return token
+
+    async def exchange_refresh_token(
+        self,
+        client: OAuthClientInformationFull,
+        refresh_token: RefreshToken,
+        scopes: List[str],
+    ) -> OAuthToken:
+        self.refresh_tokens.pop(refresh_token.token, None)
+        return self._issue_tokens(client.client_id, scopes or refresh_token.scopes)
+
+    async def load_access_token(self, token: str) -> Optional[AccessToken]:
+        access = self.access_tokens.get(token)
+        if access is None:
+            return None
+        if access.expires_at and access.expires_at < time.time():
+            del self.access_tokens[token]
+            return None
+        return access
+
+    async def revoke_token(self, token) -> None:
+        self.access_tokens.pop(token.token, None)
+        self.refresh_tokens.pop(token.token, None)
+
+    def _issue_tokens(self, client_id: str, scopes: List[str]) -> OAuthToken:
+        access_token = secrets.token_urlsafe(32)
+        refresh_token = secrets.token_urlsafe(32)
+        expires_at = int(time.time()) + ACCESS_TOKEN_TTL_SECONDS
+        self.access_tokens[access_token] = AccessToken(
+            token=access_token, client_id=client_id, scopes=scopes, expires_at=expires_at,
+        )
+        self.refresh_tokens[refresh_token] = RefreshToken(
+            token=refresh_token, client_id=client_id, scopes=scopes, expires_at=None,
+        )
+        return OAuthToken(
+            access_token=access_token,
+            refresh_token=refresh_token,
+            expires_in=ACCESS_TOKEN_TTL_SECONDS,
+            scope=" ".join(scopes) if scopes else None,
+        )
+
+
+# Auth (OAuth for claude.ai's remote-MCP connector) is only meaningful over
+# streamable-http; stdio (local Claude Code/Desktop) never builds the HTTP
+# app these routes live on, so it's harmless to leave unconfigured there.
+_oauth_provider: Optional[SingleUserOAuthProvider] = None
+if os.environ.get("MFP_TRANSPORT") == "streamable-http":
+    _public_host = os.environ.get("MFP_PUBLIC_HOST", "localhost")
+    _issuer_url = f"https://{_public_host}"
+    _oauth_provider = SingleUserOAuthProvider(shared_secret=os.environ.get("MFP_AUTH_TOKEN", ""))
+    mcp = FastMCP(
+        "myfitnesspal_mcp",
+        auth=AuthSettings(
+            issuer_url=_issuer_url,
+            resource_server_url=_issuer_url,
+            client_registration_options=ClientRegistrationOptions(
+                enabled=True, default_scopes=["mfp"], valid_scopes=["mfp"]
+            ),
+            revocation_options=RevocationOptions(enabled=True),
+        ),
+        auth_server_provider=_oauth_provider,
+    )
+else:
+    mcp = FastMCP("myfitnesspal_mcp")
+
+
+@mcp.custom_route("/health", methods=["GET"])
+async def health_check(request):
+    from starlette.responses import PlainTextResponse
+
+    return PlainTextResponse("ok")
+
+
+@mcp.custom_route("/authorize/approve", methods=["GET"])
+async def authorize_approve_form(request):
+    from starlette.responses import HTMLResponse
+
+    request_id = request.query_params.get("request_id", "")
+    return HTMLResponse(f"""<!doctype html>
+<html><body style="font-family:sans-serif;max-width:400px;margin:80px auto">
+<h3>Connect to MyFitnessPal MCP</h3>
+<p>Enter the server's auth token to approve this connection.</p>
+<form method="post" action="/authorize/approve">
+  <input type="hidden" name="request_id" value="{request_id}">
+  <input type="password" name="token" placeholder="Auth token"
+         style="width:100%;padding:8px;box-sizing:border-box" autofocus>
+  <button type="submit" style="margin-top:12px;padding:8px 16px">Approve</button>
+</form>
+</body></html>""")
+
+
+@mcp.custom_route("/authorize/approve", methods=["POST"])
+async def authorize_approve_submit(request):
+    from starlette.responses import HTMLResponse, RedirectResponse
+
+    form = await request.form()
+    request_id = form.get("request_id", "")
+    token = form.get("token", "")
+
+    if not _oauth_provider or token != _oauth_provider.shared_secret:
+        return HTMLResponse("<p>Incorrect token.</p>", status_code=401)
+
+    redirect_url = _oauth_provider.complete_authorization(request_id)
+    if redirect_url is None:
+        return HTMLResponse(
+            "<p>This authorization request has expired or is invalid -- "
+            "go back to claude.ai and try connecting again.</p>",
+            status_code=400,
+        )
+    return RedirectResponse(redirect_url, status_code=302)
 
 # Configuration paths
 CONFIG_DIR = Path.home() / ".mfp_mcp"
@@ -2882,62 +3086,19 @@ async def mfp_delete_custom_food(params: DeleteCustomFoodInput) -> str:
         return f"Error deleting custom food: {str(e)}"
 
 
-def _build_http_app():
-    """
-    Wrap the FastMCP streamable-http ASGI app with:
-      - an unauthenticated GET /health for Railway's healthcheck
-      - a bearer-token check (MFP_AUTH_TOKEN) on everything else, since this
-        endpoint is a public URL with full read/write access to the diary
-    """
-    from starlette.applications import Starlette
-    from starlette.responses import Response, PlainTextResponse
-    from starlette.routing import Mount, Route
-
-    token = os.environ.get("MFP_AUTH_TOKEN")
-    if not token:
-        logger.warning(
-            "MFP_AUTH_TOKEN is not set -- the HTTP endpoint will accept "
-            "unauthenticated requests. Set it before exposing this publicly."
-        )
-
-    mcp_app = mcp.streamable_http_app()
-
-    class BearerAuthMiddleware:
-        def __init__(self, app, expected_token):
-            self.app = app
-            self.expected_token = expected_token
-
-        async def __call__(self, scope, receive, send):
-            if scope["type"] != "http" or not self.expected_token:
-                await self.app(scope, receive, send)
-                return
-            headers = dict(scope.get("headers") or [])
-            auth = headers.get(b"authorization", b"").decode()
-            if auth != f"Bearer {self.expected_token}":
-                response = Response("Unauthorized", status_code=401)
-                await response(scope, receive, send)
-                return
-            await self.app(scope, receive, send)
-
-    return Starlette(
-        routes=[
-            Route("/health", lambda request: PlainTextResponse("ok")),
-            Mount("/", app=BearerAuthMiddleware(mcp_app, token)),
-        ],
-        # mcp_app's own lifespan starts its StreamableHTTPSessionManager's
-        # task group; Mount doesn't propagate a sub-app's lifespan, so this
-        # wrapper app must trigger it explicitly or every request 500s with
-        # "Task group is not initialized".
-        lifespan=mcp_app.router.lifespan_context,
-    )
-
-
 def main():
     """Run the MCP server.
 
     Transport is selected via MFP_TRANSPORT ("stdio", default; or
     "streamable-http" for a hosted/cloud deployment reachable by remote MCP
     clients such as Claude's voice mode). stdio behavior is unchanged.
+
+    In streamable-http mode, mcp.streamable_http_app() already wires up the
+    OAuth routes (register/authorize/token/revoke), the /health and
+    /authorize/approve custom routes, and bearer-auth on /mcp itself -- see
+    the SingleUserOAuthProvider construction above, which must happen before
+    any @mcp.tool()/@mcp.custom_route() decorator runs, hence it's at import
+    time rather than here.
     """
     transport = os.environ.get("MFP_TRANSPORT", "stdio")
 
@@ -2959,7 +3120,7 @@ def main():
                 "reject requests to any host other than localhost."
             )
 
-        app = _build_http_app()
+        app = mcp.streamable_http_app()
         uvicorn.run(app, host=mcp.settings.host, port=mcp.settings.port, log_level="info")
     else:
         mcp.run()
