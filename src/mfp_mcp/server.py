@@ -18,6 +18,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import sqlite3
 import subprocess
 import sys
@@ -1576,15 +1577,68 @@ def get_food_v2(client, mfp_id: str) -> Dict[str, Any]:
     return items[0]
 
 
+# Canonical measurement-unit token -> what any of these words/abbreviations mean.
+# Deliberately does NOT include "container", "pack", "bag", etc: those are
+# count units whose real weight/volume is only described in free text (e.g.
+# "container (8 oz ea.)"), and must never satisfy a weight/volume request --
+# see the 2026-07 bug below.
+_UNIT_ALIASES = {
+    "oz": "oz", "ounce": "oz", "ounces": "oz",
+    "g": "g", "gram": "g", "grams": "g", "gm": "g",
+    "kg": "kg", "kilogram": "kg", "kilograms": "kg",
+    "lb": "lb", "lbs": "lb", "pound": "lb", "pounds": "lb",
+    "mg": "mg", "milligram": "mg", "milligrams": "mg",
+    "ml": "ml", "milliliter": "ml", "milliliters": "ml", "millilitre": "ml",
+    "l": "l", "liter": "l", "liters": "l", "litre": "l",
+    "cup": "cup", "cups": "cup",
+    "tbsp": "tbsp", "tablespoon": "tbsp", "tablespoons": "tbsp",
+    "tsp": "tsp", "teaspoon": "tsp", "teaspoons": "tsp",
+    "scoop": "scoop", "scoops": "scoop",
+    "serving": "serving", "servings": "serving",
+    "piece": "piece", "pieces": "piece",
+    "slice": "slice", "slices": "slice",
+}
+
+
+def _canonical_unit_tokens(raw: str) -> set:
+    """
+    Reduce a unit string to canonical measurement tokens for comparison.
+
+    Strips parenthetical descriptors (e.g. "container (8 oz ea.)" -> just
+    "container" -- the "8 oz" there describes the container, it is NOT the
+    logging unit) and collapses "fl oz"/"fluid ounce(s)" to a single token
+    distinct from bare "oz", since dry oz and fluid oz are not the same
+    measurement and were previously conflated by substring matching.
+    """
+    s = raw.lower()
+    s = re.sub(r"\([^)]*\)", " ", s)
+    s = re.sub(r"fl\.?\s*oz\.?|fluid\s+ounces?", " flounit ", s)
+    tokens = re.findall(r"[a-z]+", s)
+    out = set()
+    for t in tokens:
+        if t == "flounit":
+            out.add("fl_oz")
+        elif t in _UNIT_ALIASES:
+            out.add(_UNIT_ALIASES[t])
+    return out
+
+
 def select_serving_size(food: Dict[str, Any], unit: Optional[str] = None) -> Dict[str, Any]:
     """
     Choose which of a food's serving sizes to log against.
 
     Args:
         food: Food object from get_food_v2
-        unit: Optional unit to match (e.g. "oz", "medium breast"). Matching is
-            case-insensitive and accepts a substring. Falls back to the food's
-            default (first) serving size when omitted or unmatched.
+        unit: Optional unit to match (e.g. "oz", "medium breast"). Matched by
+            canonical measurement token (see _canonical_unit_tokens), not raw
+            substring -- raw substring matching previously let a request for
+            "oz" match a "container (8 oz ea.)" record (the literal substring
+            "oz" appears in that descriptor) and log against its count-based
+            value instead of an actual ounce record, silently inflating the
+            logged amount (verified bug, 2026-07: "4 oz" -> 32 oz). Falls
+            back to loose substring matching only for units this table
+            doesn't recognize (e.g. "medium breast"), and to the food's
+            default (first) serving size when omitted or unmatched entirely.
 
     Returns:
         The serving size dict, trimmed to the fields the diary API permits
@@ -1598,12 +1652,24 @@ def select_serving_size(food: Dict[str, Any], unit: Optional[str] = None) -> Dic
 
     chosen = serving_sizes[0]
     if unit:
-        wanted = unit.strip().lower()
-        for size in serving_sizes:
-            size_unit = str(size.get("unit", "")).lower()
-            if size_unit == wanted or wanted in size_unit:
-                chosen = size
-                break
+        wanted_tokens = _canonical_unit_tokens(unit)
+        match = None
+        if wanted_tokens:
+            for size in serving_sizes:
+                if wanted_tokens & _canonical_unit_tokens(str(size.get("unit", ""))):
+                    match = size
+                    break
+        if match is None:
+            # Unit not in the canonical table (e.g. "medium breast") -- fall
+            # back to the old loose substring match rather than giving up.
+            wanted = unit.strip().lower()
+            for size in serving_sizes:
+                size_unit = str(size.get("unit", "")).lower()
+                if size_unit == wanted or wanted in size_unit:
+                    match = size
+                    break
+        if match is not None:
+            chosen = match
         else:
             logger.warning(
                 f"Unit {unit!r} not found for food {food.get('id')}; "
