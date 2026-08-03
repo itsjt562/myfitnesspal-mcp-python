@@ -2123,9 +2123,32 @@ def remove_food_entry(client, entry_id: str) -> None:
     Delete a food diary entry by its food_entry_id.
 
     Uses the legacy /food/remove/{id} endpoint with X-CSRF-Token from
-    the diary page meta tag.
+    the diary page meta tag. This endpoint expects MFP's legacy numeric
+    diary_entry_id (as scraped by list_diary_entries / returned by this
+    tool's own name_contains mode) -- NOT the v2-API UUID that
+    mfp_add_food_to_diary returns as its entry_id. Those are two different
+    ID spaces from two different MFP APIs. Verified live, 2026-08: passing
+    add's UUID here doesn't 404 -- the endpoint just redirects back to the
+    diary page (302) for ANY path segment, numeric or not, which the old
+    status-code-only success check treated as "removed" even though
+    nothing was deleted. A second removal by name still found the same
+    entry sitting in the diary. Reject non-numeric ids up front instead of
+    silently reporting a false success.
+
+    Raises:
+        RuntimeError: If entry_id isn't a bare numeric legacy id, or if the
+            delete request itself fails.
     """
     import re
+
+    if not entry_id.isdigit():
+        raise RuntimeError(
+            f"entry_id {entry_id!r} isn't a MyFitnessPal legacy diary "
+            "entry id (digits only). This is likely the UUID "
+            "mfp_add_food_to_diary returned, which belongs to a different "
+            "MFP API and can't be used here -- use name_contains instead "
+            "to remove a just-added entry."
+        )
 
     # Need a fresh CSRF token from the diary page
     diary_resp = client.session.get(
@@ -2793,12 +2816,16 @@ async def mfp_add_food_to_diary(params: AddFoodToDiaryInput) -> str:
               instead, since a food's "1 serving" can itself be several oz/g.
 
     Returns:
-        str: Confirmation message with details of the added food entry
+        str: Confirmation message with details of the added food entry.
+            The entry_id in this response is NOT usable with
+            mfp_remove_food_from_diary's entry_id mode (different MFP API,
+            different id space -- that mode will reject it). To undo this
+            add, call mfp_remove_food_from_diary with name_contains instead.
     """
     try:
         client = get_mfp_client()
         target_date = parse_date(params.date)
-        
+
         # Normalize meal name. .title() (not .capitalize()) so multi-word
         # custom meal names like "Pre Workout" keep every word capitalized.
         meal = params.meal.strip().title()
@@ -2854,12 +2881,17 @@ async def mfp_remove_food_from_diary(params: RemoveFoodFromDiaryInput) -> str:
 
     Two modes:
 
-    1. By entry_id (precise): delete exactly the entry whose
-       food_entry_id matches. Use this when you already know the ID.
+    1. By entry_id (precise): delete exactly the entry whose legacy
+       numeric food_entry_id matches -- the id list_diary_entries scrapes
+       and this tool's own name_contains mode returns. Do NOT use the
+       entry_id that mfp_add_food_to_diary returns: that's a UUID from a
+       different MFP API and this mode will reject it. To undo a food you
+       just added, use name_contains instead.
 
     2. By name_contains (fuzzy): list the day's entries, find ones whose
        name contains the given substring (case-insensitive), optionally
-       restricted to a meal, and delete up to max_matches of them.
+       restricted to a meal, and delete up to max_matches of them. This is
+       the right mode for "undo that" / "remove what I just logged".
 
     Args:
         params: RemoveFoodFromDiaryInput with one of:

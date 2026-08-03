@@ -25,6 +25,7 @@ from mfp_mcp.server import (
     _serving_sizes,
     mfp_set_goals,
     SetGoalsInput,
+    remove_food_entry,
 )
 
 
@@ -289,6 +290,46 @@ def test_set_goals_no_fields_provided_errors_without_calling_client():
 
     assert "Error" in result
     mock_client.set_new_goal.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# remove_food_entry -- entry_id id-space validation.
+#
+# mfp_add_food_to_diary returns a v2-API UUID as its entry_id.
+# remove_food_entry's legacy /food/remove/{id} endpoint expects MFP's
+# legacy numeric diary_entry_id (the id list_diary_entries scrapes) --
+# a completely different id space. Verified live, 2026-08: passing the
+# UUID through doesn't 404, it 302-redirects like any other path segment,
+# which the old status-code-only check treated as a successful delete even
+# though nothing was removed -- a false "success" that leaves the entry
+# sitting in the diary. Must reject non-numeric ids before ever making the
+# request.
+# ---------------------------------------------------------------------------
+
+def test_remove_food_entry_rejects_uuid_from_add_food_to_diary():
+    mock_client = MagicMock()
+    uuid_entry_id = "33a67353-741c-4829-865d-a366a1cdcded"
+
+    with pytest.raises(RuntimeError, match="isn't a MyFitnessPal legacy diary entry id"):
+        remove_food_entry(mock_client, uuid_entry_id)
+
+    # must fail before ever touching the network
+    mock_client.session.get.assert_not_called()
+    mock_client.session.request.assert_not_called()
+
+
+def test_remove_food_entry_accepts_legacy_numeric_id():
+    mock_client = MagicMock()
+    mock_client.session.get.return_value.text = (
+        '<meta name="csrf-token" content="tok123">'
+    )
+    mock_client.session.request.return_value.status_code = 302
+
+    remove_food_entry(mock_client, "12890177447")
+
+    mock_client.session.request.assert_called_once()
+    called_url = mock_client.session.request.call_args[0][1]
+    assert called_url.endswith("food/remove/12890177447")
 
 
 if __name__ == "__main__":
