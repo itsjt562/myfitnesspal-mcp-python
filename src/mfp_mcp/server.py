@@ -1732,10 +1732,20 @@ def select_serving_size(food: Dict[str, Any], unit: Optional[str] = None) -> Dic
         wanted_tokens = _canonical_unit_tokens(unit)
         match = None
         if wanted_tokens:
-            for size in serving_sizes:
-                if wanted_tokens & _canonical_unit_tokens(str(size.get("unit", ""))):
-                    match = size
-                    break
+            # A food can declare the same canonical unit at multiple
+            # granularities (e.g. both "8.00 x fl oz" and "1.00 x fl oz").
+            # Division math (in add_food_to_diary) produces the correct
+            # total against ANY of them, but the smallest value gives the
+            # cleanest servings count -- e.g. 14 fl oz against a 1-fl-oz
+            # record is exactly 14.0 servings, not 1.75 against an 8-fl-oz
+            # record. Same total logged either way; prefer the reading that
+            # doesn't look like a rounding artifact.
+            candidates = [
+                size for size in serving_sizes
+                if wanted_tokens & _canonical_unit_tokens(str(size.get("unit", "")))
+            ]
+            if candidates:
+                match = min(candidates, key=lambda s: float(s.get("value") or 1.0))
         if match is None:
             # Unit not in the canonical table (e.g. "medium breast") -- fall
             # back to the old loose substring match rather than giving up.
@@ -2335,8 +2345,16 @@ async def mfp_search_food(params: SearchFoodInput) -> str:
     """
     Search the MyFitnessPal food database for food items.
 
-    Returns a list of matching foods with their name, brand, serving size,
-    calories, and MFP ID (which can be used with mfp_get_food_details).
+    Returns a list of matching foods with their name, brand, default
+    serving, calories, MFP ID, and every unit each food can be logged
+    against (available_units) -- so a unit for mfp_add_food_to_diary can be
+    picked from what the food actually supports, without a separate
+    mfp_get_food_details round trip. Matters because a food can declare the
+    same unit at more than one granularity (e.g. both "8.00 x fl oz" and
+    "1.00 x fl oz") -- mfp_add_food_to_diary already prefers the finer one
+    internally, but seeing the real list up front avoids guessing a unit
+    the food doesn't support at all and falling back to an approximate
+    substring match.
 
     Args:
         params: SearchFoodInput containing:
@@ -2357,22 +2375,30 @@ async def mfp_search_food(params: SearchFoodInput) -> str:
         data = {"query": params.query, "count": len(results), "results": []}
 
         for item in results:
-            data["results"].append(
-                {
-                    "name": item.name,
-                    "brand": item.brand,
-                    "serving": item.serving,
-                    "calories": item.calories,
-                    # str(), not the library's raw int -- every downstream
-                    # tool (mfp_get_food_details, mfp_add_food_to_diary, ...)
-                    # requires mfp_id as a string and 422s on a bare int, so
-                    # an int here breaks the natural search -> details/add
-                    # chain (verified bug, 2026-07: pydantic
-                    # "Input should be a valid string" on the first search
-                    # result's mfp_id fed straight into mfp_get_food_details).
-                    "mfp_id": str(item.mfp_id),
-                }
-            )
+            entry = {
+                "name": item.name,
+                "brand": item.brand,
+                "serving": item.serving,
+                "calories": item.calories,
+                # str(), not the library's raw int -- every downstream
+                # tool (mfp_get_food_details, mfp_add_food_to_diary, ...)
+                # requires mfp_id as a string and 422s on a bare int, so
+                # an int here breaks the natural search -> details/add
+                # chain (verified bug, 2026-07: pydantic
+                # "Input should be a valid string" on the first search
+                # result's mfp_id fed straight into mfp_get_food_details).
+                "mfp_id": str(item.mfp_id),
+            }
+            try:
+                food = get_food_v2(client, item.mfp_id)
+                entry["available_units"] = [
+                    f"{float(s['value']):.2f} x {s['unit']}"
+                    for s in (food.get("serving_sizes") or [])
+                ]
+            except Exception as e:
+                logger.warning(f"Could not fetch serving units for {item.mfp_id}: {e}")
+                entry["available_units"] = None
+            data["results"].append(entry)
 
         return format_response(
             data, params.response_format, f"Food Search Results for '{params.query}'"
@@ -2811,7 +2837,10 @@ async def mfp_add_food_to_diary(params: AddFoodToDiaryInput) -> str:
               Pass the actual amount directly -- this tool converts it to MFP's
               internal serving-count math itself, never pre-divide it yourself.
             - unit (str, REQUIRED): Unit for quantity (e.g. 'oz', 'g', 'cup', 'ml').
-              Use unit='serving' only to mean N servings of the food's default
+              Pick from this food's mfp_search_food result's available_units
+              list when possible, rather than guessing -- units the food
+              doesn't declare fall back to an approximate match. Use
+              unit='serving' only to mean N servings of the food's default
               serving size -- most real amounts should use a weight/volume unit
               instead, since a food's "1 serving" can itself be several oz/g.
 

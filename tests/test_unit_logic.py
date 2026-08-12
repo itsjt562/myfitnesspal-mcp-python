@@ -119,6 +119,29 @@ def test_select_serving_size_no_serving_sizes_raises():
         select_serving_size({"id": "4", "serving_sizes": []}, "oz")
 
 
+def test_select_serving_size_prefers_smallest_granularity_among_same_unit():
+    """Regression test for the 2026-08 orange juice report: a food can
+    declare the same canonical unit at multiple granularities (e.g. both
+    '8.00 x fl oz' and '1.00 x fl oz'). Division math produces the correct
+    TOTAL against either record, but matching the coarser one first turns
+    '14 fl oz' into '1.75 servings of 8 fl oz' -- mathematically fine, but
+    reads like a rounding error. Must prefer the finer-grained record so
+    '14 fl oz' becomes a clean 14.0 servings of 1 fl oz instead."""
+    food = {
+        "id": "oj",
+        "serving_sizes": [
+            {"value": 8.0, "unit": "fl oz", "nutrition_multiplier": 8.0},
+            {"value": 1.0, "unit": "fl oz", "nutrition_multiplier": 1.0},
+        ],
+    }
+    chosen = select_serving_size(food, "fl oz")
+    assert chosen["value"] == 1.0
+
+    quantity = 14.0
+    servings = quantity / float(chosen["value"])
+    assert servings == 14.0  # clean, not 1.75
+
+
 def test_select_serving_size_defaults_to_first_when_unit_omitted():
     food = {
         "id": "5",
